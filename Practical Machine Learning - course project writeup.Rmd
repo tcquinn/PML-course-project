@@ -1,0 +1,131 @@
+---
+title: "Evaluating weight-lifting technique using body-worn sensor data"
+date: "Thursday, August 21, 2014"
+output: html_document
+---
+## Executive summary
+
+Using data from [Velosso et al.](http://groupware.les.inf.puc-rio.br/public/papers/2013.Velloso.QAR-WLE.pdf), we attempt to classify user weight-lifting technique based on data from body-worn sensors. After structuring the data and identifying a plausible set of predictors, we contruct and evaluate two models: a simple classification tree and a random forest. We select the random forest as our final model based on its high cross-validation accuracy (99.2%). In order to more reliably estimate out-of-sample accuracy, we test this model on a held-out test set, achieving 99.4% accuracy. Based on feedback from the course website, this model has perfect accuracy on an additional (small) supplied test set.
+
+## Introduction
+
+Many emerging applications involve the use of body-worn sensor data (from smartphones or other devices) to analyze user motion (e.g., [Fitbit](http://www.fitbit.com/), [Nike FuelBand](http://www.nike.com/us/en_us/c/nikeplus-fuelband), and [Jawbone Up](https://jawbone.com/up)). In this exercise, as part of the [Practical Machine Learning](https://www.coursera.org/course/predmachlearn) course within the Coursera [Data Science Specialization](https://www.coursera.org/specialization/jhudatascience/1?utm_medium=listingPage), we attempt to distinguish different kinds of weight-lifting motions using data from wearable sensors in order to determine whether the user is demonstrating correct technique or one of four common incorrect techniques. We use data from the work of Velosso et al., written up on [their website](http://groupware.les.inf.puc-rio.br/public/papers/2013.Velloso.QAR-WLE.pdf).
+
+## Structuring the data
+
+The data comes to us in the from of two CSV files supplied by the course instructors: `pml-training.csv` and `pml-testing.csv`. The former contains 19,622 observations of 160 variables while the latter contains 20 observations of 160 variables.
+
+The first seven variables in the supplied training set are housekeeping variables: a record ID, the user's name, time stamps for the measurements in different formats, an indicator of whether the observation marks a new window (`new_window`) and an ID number for the window (`num_window`). The next 152 variables are all sensor data from the various sensors worn by the user during the weight-lifting exercises. The last variable (`classe`) is the variable we're trying to predict. It's a qualitative description of the technique being demonstrated by the user, coded by letters A through E (again see [Velosso et al.](http://groupware.les.inf.puc-rio.br/public/papers/2013.Velloso.QAR-WLE.pdf) for the details).
+
+The supplied testing set is identical in structure to the supplied training set except that it omits the response variable (`classe`) and instead includes a `problem_id` variable (simply an integer from 1 to 20, to assist in submission of our final predictions).
+
+The first step is to load the data (as well as the libraries we will need for the subsequent analysis) and convert the variables to the right internal format (by default, some of the sensor variables load as factors rather than numerical variables because of the presence of blanks, NAs, or `#DIV/0` fields):
+
+```{r, warning=FALSE, message=FALSE}
+library(caret)
+library(rattle)
+
+training <- read.csv("pml-training.csv")
+testing <- read.csv("pml-testing.csv")
+
+training$cvtd_timestamp <- strptime(training$cvtd_timestamp, "%d/%m/%Y %H:%M")
+testing$cvtd_timestamp <- strptime(testing$cvtd_timestamp, "%d/%m/%Y %H:%M")
+
+training[,8:159] <- sapply(training[,8:159],
+                           function(x) as.numeric(as.character(x)))
+testing[,8:159] <- sapply(testing[,8:159],
+                          function(x) as.numeric(as.character(x)))
+```
+
+The next thing to notice is that there are two different types of rows in the `testing` data: 19,216 rows with `new_window='no'` and 406 rows with `new_window='yes'`. These two types of rows differ in at least one important respect. The `new_window='yes'` rows contain a number of additional variables that the `new_window='no'` rows do not. All of these additional variables appear to be statistical summaries of the samples in the preceding window (e.g., kurtosis, skewness, max, min, amplitude, variance, average, etc.) Without a detailed code book, it's impossible to know whether the other variables in these `new_window='yes'` rows also differ from their counterparts in the `new_window='no'` rows (e.g., they could also be summaries of the data in the preceding rows). In order to be conservative, we separate these two types of data and focus on building a prediction model for the `new_window='no'` rows (since this is the type of data in the `testing` set and therefore we infer that this is the type of data that our model will face in the future): 
+```{r}
+training <- subset(training, new_window=='no')
+```
+Next, we further split the supplied training set into a `training.train` set and a `training.test` set so we can use the latter to estimate the out-of-sample error after we've constructed and selected our final model (we can usually get a reasonable estimate of the out-of-sample error from the resampling data we generate during model construction, but these resampling estimates have various trade-offs and limitations; see Chapter 7 of [_The Elements of Statistical Learning_](http://statweb.stanford.edu/~tibs/ElemStatLearn/) for more detail):
+```{r}
+set.seed(54321)
+in.train <- createDataPartition(training$classe, p=3/4)
+training.train <- training[in.train[[1]],]
+training.test <- training[-in.train[[1]],]
+rm(training)
+```
+For our predictors, we select all of the sensor data, excluding the housekeeping variables (since any predictive value from these variables will presumably *not* apply out of sample), the response variable (`classe`), and the variables that are `NA` for all rows. This leaves us with 52 predictors:
+```{r}
+vars.housekeeping <- c(1:7)
+vars.response <- 160
+vars.allna <- which(sapply(training.train, function(x) all(is.na(x))))
+vars.exclude <- c(vars.housekeeping, vars.response, vars.allna)
+training.train.predictors <- training.train[,-vars.exclude]
+dim(training.train.predictors)
+```
+For our response variable, we simply grab the `classe` variable:
+```{r}
+training.train.response <- training.train[,160]
+table(training.train.response)
+```
+
+## Model construction and selection
+
+We use the `caret` package to construct, evaluate, and select our model. This package uses resampling to evaluate the performance of each model for each choice of model parameters. In order to minimize computational cost and maximize simplicity and interpretability of our accuracy results, we select simple 10-fold cross-validation as our resampling approach (rather than the default bootstrap approach):
+```{r}
+trControl.cv <- trainControl(method="cv", number=10)
+```
+
+First, we build a simple classification tree model in order to see how far we can get with a simple, easily interpretable model. By default, when fitting simple classification trees, the `train` function in the `caret` package tries a range of different values for the complexity paramter (`cp`) (i.e., any split that does not decrease the overall lack of fit by a factor of `cp` is not attempted) and selects the best value based on resampling accuracy:
+```{r, cache=TRUE, message=FALSE}
+set.seed(31245)
+rpart.default <- train(x=training.train.predictors,
+                       y=training.train.response,
+                       method="rpart", trControl=trControl.cv)
+print(rpart.default, digits=3)
+```
+As we can see, the accuracy of this model is quite poor (cross-validation accuracy is only 55.9%). In Figure 1, we can see what's going on. The tree easily identifies a large subset of the A class and a large subet of the E class based on just two predictors (`roll_belt` and `pitch_forearm`), but then struggles to disentangle the B, C, and D classes from each other and from the remaining A and E cases. By plotting the classes against the two main variables in the tree (see Figure 2), we can see why this is happening. The model identifies the E cases on the right-hand side and the A cases on the lower-left but fails to separate the other cases.
+
+We therefore try a more powerful (but more complex, more computationally costly, and less interpretable) model, the random forest. By default, when fitting random forests, the `caret` package tries a range of different values for `m_try`, the number of variables randomly sampled as candidates at each split, and selects the best parameter value based on resampling accuracy (this call to the `train` function takes about an hour on a middle-of-the-road laptop, even with the simple resampling approach):
+```{r, cache=TRUE, message=FALSE}
+set.seed(31245)
+rf.default <- train(x=training.train.predictors,
+                    y=training.train.response,
+                    method="rf", trControl=trControl.cv)
+print(rf.default, digits=3)
+rf.default$finalModel
+```
+This model gives dramatically improved performance (cross-validation accuracy of 99.2%) with strong performance across all classes. We select this as our final model.
+
+## Estimating out-of-sample error
+
+In order to estimate out-of-sample error, we apply our chosen model to the `training.test` set we constructed earlier:
+```{r}
+training.test.predictors <- training.test[,-vars.exclude]
+training.test.response <- training.test[,160]
+training.test.predictions <- predict(rf.default,
+                                     newdata=training.test.predictors)
+confusionMatrix(training.test.predictions, training.test.response)
+```
+The accuracy on the `training.test` set (99.4%) suggests that our earlier cross-validation estimate of the out-of-sample error was reasonable.
+
+## Generating predictions for the supplied testing set
+
+Finally, we apply the model to the supplied `testing` set (for which we have no class data):
+```{r}
+testing.predictors <- testing[,-vars.exclude]
+testing.predictions <- predict(rf.default,
+                               newdata=testing.predictors)
+testing.predictions
+```
+Based on the feedback from the course website, all 20 of these predictions are correct.
+
+## Figures
+
+### Figure 1
+```{r, message=FALSE}
+fancyRpartPlot(rpart.default$finalModel)
+```
+
+### Figure 2
+```{r}
+simpleplot <- qplot(training.train.predictors$roll_belt,
+                    training.train.predictors$pitch_forearm,
+                    color=training.train.response)
+simpleplot + xlab("roll_belt") + ylab("pitch_forearm") + labs(color="classe")
+```
